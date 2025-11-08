@@ -10,6 +10,11 @@ import { createProject, putChunk, getChunk, getProject } from "./utils/chunkStor
 
 config();
 const app = express();
+
+// detect environment
+const BASE_URL = process.env.BASE_URL || "http://localhost:5050";
+const PORT = process.env.PORT || 8080;
+
 app.use(cors());
 app.use(express.json());
 
@@ -18,15 +23,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 /* ------------------------------------------------------------------ */
 /* Helper: Inject SDK + init automatically into any HTML file         */
 /* ------------------------------------------------------------------ */
-function injectSdkIntoHtml(html, sdkSnippet, projectId, envKey) {
-  // Construct a working version of the snippet with correct URLs
+function injectSdkIntoHtml(html, projectId, envKey) {
   const injectedSnippet = `
 <!-- CodeMask SDK (auto-injected) -->
-<script src="http://localhost:5050/sdk/codemask-sdk.js"></script>
+<script src="${BASE_URL}/sdk/codemask-sdk.js"></script>
 <script>
   if (window.CodeMask) {
     window.CodeMask.init({
-      baseUrl: "http://localhost:5050",
+      baseUrl: "${BASE_URL}",
       projectId: "${projectId}",
       key: "${envKey}"
     });
@@ -37,7 +41,6 @@ function injectSdkIntoHtml(html, sdkSnippet, projectId, envKey) {
 <!-- End CodeMask SDK -->
 `;
 
-  // place the snippet before main.js or before </body>
   if (html.includes("main.js")) {
     return html.replace(
       /<script[^>]*src=["'][^"']*main\.js["'][^>]*><\/script>/i,
@@ -46,7 +49,6 @@ function injectSdkIntoHtml(html, sdkSnippet, projectId, envKey) {
   } else if (html.includes("</body>")) {
     return html.replace(/<\/body>/i, `${injectedSnippet}\n</body>`);
   } else {
-    // fallback: append at the end
     return html + `\n${injectedSnippet}`;
   }
 }
@@ -63,7 +65,7 @@ app.post("/api/mask", upload.array("files"), async (req, res) => {
 
     const files = (req.files || []).map((f) => ({
       relativePath: f.originalname,
-      content: f.buffer
+      content: f.buffer,
     }));
 
     const { processedFiles, chunks } = processFiles(files);
@@ -75,15 +77,15 @@ app.post("/api/mask", upload.array("files"), async (req, res) => {
         name: c.name,
         params: c.params,
         body: c.body,
-        original: c.original
+        original: c.original,
       });
     }
 
-    // Prepare the SDK snippet for display
-    const sdkSnippet = `<script src="http://localhost:5050/sdk/codemask-sdk.js"></script>
+    // SDK snippet (for frontend display)
+    const sdkSnippet = `<script src="${BASE_URL}/sdk/codemask-sdk.js"></script>
 <script>
   window.CodeMask.init({
-    baseUrl: "http://localhost:5050",
+    baseUrl: "${BASE_URL}",
     projectId: "${projectId}",
     key: "${envKey}"
   });
@@ -92,21 +94,21 @@ app.post("/api/mask", upload.array("files"), async (req, res) => {
     // Inject SDK automatically into HTML files
     for (let file of processedFiles) {
       if (file.relativePath.endsWith(".html")) {
-        file.content = injectSdkIntoHtml(file.content, sdkSnippet, projectId, envKey);
+        file.content = injectSdkIntoHtml(file.content, projectId, envKey);
       }
     }
 
-    // Zip the processed files
+    // Zip and respond
     const zipBuffer = makeZip(processedFiles);
     const base64Zip = zipBuffer.toString("base64");
 
-    return res.json({
+    res.json({
       projectId,
       envKey,
       sdkSnippet,
       message:
-        "SDK snippet auto-injected into your HTML files. You can still copy the snippet manually if needed.",
-      download: base64Zip
+        "SDK snippet auto-injected into your HTML files. You can still copy it manually if needed.",
+      download: base64Zip,
     });
   } catch (e) {
     console.error("MASK ERROR:", e);
@@ -142,7 +144,12 @@ app.get("/api/fetch/:projectId/:chunkId", (req, res) => {
 
   if (chunk.type === "decl" || chunk.type === "arrow") {
     const funcSource = `(${chunk.params}) => { ${chunk.body} }`;
-    return res.json({ ok: true, kind: "function", name: chunk.name, code: funcSource });
+    return res.json({
+      ok: true,
+      kind: "function",
+      name: chunk.name,
+      code: funcSource,
+    });
   }
 
   // constants / raw
@@ -212,7 +219,7 @@ app.get("/sdk/codemask-sdk.js", (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Start Server                                                       */
 /* ------------------------------------------------------------------ */
-const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("✅ CodeMask backend running on port " + PORT);
+  console.log(`✅ CodeMask backend running on port ${PORT}`);
+  console.log(`🌐 BASE_URL = ${BASE_URL}`);
 });
