@@ -212,7 +212,7 @@ app.get("/sdk/codemask-sdk.js", (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Start Server                                                       */
 /* ------------------------------------------------------------------ */
-const PORT = process.env.PORT || 5050;
-app.listen(PORT, () => {
-  console.log("CodeMask backend running on http://localhost:" + PORT);
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("✅ CodeMask backend running on port " + PORT);
 });
