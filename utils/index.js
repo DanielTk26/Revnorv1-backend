@@ -1,0 +1,251 @@
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import { config } from "dotenv";
+import { nanoid } from "nanoid";
+
+import { processFiles } from "./utils/parser.js";
+import { makeZip } from "./utils/zipper.js";
+import { createProject, putChunk, getChunk, getProject } from "./utils/chunkStore.js";
+
+config();
+const app = express();
+
+// detect environment
+const BASE_URL = process.env.BASE_URL || "http://localhost:5050";
+const PORT = process.env.PORT || 8080;
+
+app.use(cors());
+app.use(express.json());
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+/* ------------------------------------------------------------------ */
+/* Helper: Inject SDK + init automatically into any HTML file         */
+/* ------------------------------------------------------------------ */
+function injectSdkIntoHtml(html, projectId, envKey) {
+  const injectedSnippet = `
+<!-- CodeMask SDK (auto-injected) -->
+<script src="${BASE_URL}/sdk/codemask-sdk.js"></script>
+<script>
+  if (window.CodeMask) {
+    window.CodeMask.init({
+      baseUrl: "${BASE_URL}",
+      projectId: "${projectId}",
+      key: "${envKey}"
+    });
+  } else {
+    console.error("CodeMask SDK failed to load before init()");
+  }
+</script>
+<!-- End CodeMask SDK -->
+`;
+
+  if (html.includes("main.js")) {
+    return html.replace(
+      /<script[^>]*src=["'][^"']*main\.js["'][^>]*><\/script>/i,
+      `${injectedSnippet}\n<script src="main.js"></script>`
+    );
+  } else if (html.includes("</body>")) {
+    return html.replace(/<\/body>/i, `${injectedSnippet}\n</body>`);
+  } else {
+    return html + `\n${injectedSnippet}`;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/mask                                                     */
+/* ------------------------------------------------------------------ */
+app.post("/api/mask", upload.array("files"), async (req, res) => {
+  try {
+    const projectId = nanoid(10);
+    const envKey = nanoid(20);
+
+    createProject(projectId, envKey);
+
+    const files = (req.files || []).map((f) => ({
+      relativePath: f.originalname,
+      content: f.buffer,
+    }));
+
+    const { processedFiles, chunks } = processFiles(files);
+
+    // Store chunks in memory
+    for (const c of chunks) {
+      putChunk(projectId, c.chunkId, {
+        type: c.type,
+        name: c.name,
+        params: c.params,
+        body: c.body,
+        original: c.original,
+      });
+    }
+
+    // SDK snippet (for frontend display)
+    const sdkSnippet = `<script src="${BASE_URL}/sdk/codemask-sdk.js"></script>
+<script>
+  window.CodeMask.init({
+    baseUrl: "${BASE_URL}",
+    projectId: "${projectId}",
+    key: "${envKey}"
+  });
+</script>`;
+
+    // Inject SDK automatically into HTML files
+    for (let file of processedFiles) {
+      if (file.relativePath.endsWith(".html")) {
+        file.content = injectSdkIntoHtml(file.content, projectId, envKey);
+      }
+    }
+
+    // Zip and respond
+    const zipBuffer = makeZip(processedFiles);
+    const base64Zip = zipBuffer.toString("base64");
+
+    res.json({
+      projectId,
+      envKey,
+      sdkSnippet,
+      message:
+        "SDK snippet auto-injected into your HTML files. You can still copy it manually if needed.",
+      download: base64Zip,
+    });
+  } catch (e) {
+    console.error("MASK ERROR:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* GET /api/fetch/:projectId/:chunkId                                 */
+/* ------------------------------------------------------------------ */
+app.get("/api/fetch/:projectId/:chunkId", (req, res) => {
+  const { projectId, chunkId } = req.params;
+  const qkey = req.query.key;
+
+  const project = getProject(projectId);
+  if (!project) {
+    console.warn("FETCH 404 project:", projectId, chunkId);
+    return res.status(404).json({ error: "Project not found" });
+  }
+
+  if (qkey !== project.key) {
+    console.warn("FETCH 403 key mismatch:", projectId, chunkId);
+    return res.status(403).json({ error: "Invalid key" });
+  }
+
+  const chunk = getChunk(projectId, chunkId);
+  if (!chunk) {
+    console.warn("FETCH 404 chunk:", projectId, chunkId);
+    return res.status(404).json({ error: "Chunk not found" });
+  }
+
+  console.log("FETCH 200", projectId, chunkId, "type:", chunk.type);
+
+  if (chunk.type === "decl" || chunk.type === "arrow") {
+    const funcSource = `(${chunk.params}) => { ${chunk.body} }`;
+    return res.json({
+      ok: true,
+      kind: "function",
+      name: chunk.name,
+      code: funcSource,
+    });
+  }
+
+  // constants / raw
+  return res.json({ ok: true, kind: "raw", code: chunk.original });
+});
+
+/* ------------------------------------------------------------------ */
+/* Serve SDK (ready-safe)                                             */
+/* ------------------------------------------------------------------ */
+app.get("/sdk/codemask-sdk.js", (req, res) => {
+  const sdk = `// Lightweight CodeMask SDK (ready-safe)
+(function () {
+  const state = { baseUrl: "", projectId: "", key: "", cache: new Map() };
+  let initialized = false;
+  let waiters = [];
+  let _resolveReady;
+  const ready = new Promise(res => { _resolveReady = res; });
+
+  function init(opts) {
+    state.baseUrl = opts.baseUrl;
+    state.projectId = opts.projectId;
+    state.key = opts.key;
+    initialized = true;
+    _resolveReady();
+    const queued = waiters.slice(); waiters = [];
+    queued.forEach(fn => { try { fn(); } catch(_){} });
+    try { window.dispatchEvent(new Event("CodeMaskReady")); } catch(_) {}
+    window.CodeMask._state = state;
+  }
+
+  async function _loadImpl(chunkId) {
+    if (state.cache.has(chunkId)) return state.cache.get(chunkId);
+    const url = state.baseUrl + "/api/fetch/" + state.projectId + "/" + chunkId + "?key=" + encodeURIComponent(state.key);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("Failed to load chunk " + chunkId);
+    const data = await r.json();
+    if (data.kind === "function") {
+      const fn = new Function("return " + data.code)();
+      state.cache.set(chunkId, fn);
+      return fn;
+    } else {
+      return new Function(data.code);
+    }
+  }
+
+  function load(chunkId) {
+    if (initialized) return _loadImpl(chunkId);
+    return new Promise((resolve, reject) => {
+      waiters.push(async () => {
+        try { resolve(await _loadImpl(chunkId)); } catch (e) { reject(e); }
+      });
+    });
+  }
+
+  async function inject(chunkId) {
+    const fn = await load(chunkId);
+    return fn;
+  }
+
+  window.CodeMask = { init, load, inject, ready };
+})();
+`;
+  res.setHeader("Content-Type", "application/javascript");
+  res.send(sdk);
+});
+
+
+import { getAllProjects } from "./utils/chunkStore.js";
+
+// Full dump (projects + chunks). TEMP: do not expose in prod without protection.
+app.get("/api/debug/projects", (req, res) => {
+  res.json(getAllProjects());
+});
+
+// Light summary (counts + memory)
+app.get("/api/stats", (req, res) => {
+  const all = getAllProjects();
+  const projectIds = Object.keys(all);
+  const totalProjects = projectIds.length;
+  let totalChunks = 0;
+  for (const id of projectIds) totalChunks += Object.keys(all[id].chunks || {}).length;
+
+  const memMb = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
+
+  res.json({
+    totalProjects,
+    totalChunks,
+    memoryUsedMB: memMb,
+  });
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Start Server                                                       */
+/* ------------------------------------------------------------------ */
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ CodeMask backend running on port ${PORT}`);
+  console.log(`🌐 BASE_URL = ${BASE_URL}`);
+});

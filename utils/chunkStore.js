@@ -21,3 +21,8 @@ export function getChunk(projectId, chunkId) {
   if (!proj) return null;
   return proj.chunks.get(chunkId);
 }
+
+
+export function getAllProjects() {
+  return projects; 
+}
